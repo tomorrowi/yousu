@@ -1,0 +1,85 @@
+workflows:
+  # ──────────────────────────────────────────
+  # iOS 免费签名构建（Codemagic + free Apple ID）
+  # ──────────────────────────────────────────
+  ios-free-build:
+    name: 有速 iOS Build (Free)
+    environment:
+      flutter: stable
+      xcode: latest
+      cocoapods: default
+    scripts:
+      - name: Install dependencies
+        script: flutter pub get
+      - name: Run tests
+        script: flutter test || true
+      - name: Build iOS
+        script: |
+          flutter build ios --release --no-codesign
+      - name: Generate unsigned IPA
+        script: |
+          mkdir -p build/ios/iphoneos
+          flutter build ios --release --no-codesign
+          # 打包为 Payload
+          mkdir -p Payload
+          cp -R build/ios/iphoneos/Runner.app Payload/
+          zip -r yousu.ipa Payload/
+          rm -rf Payload
+    artifacts:
+      - build/ios/iphoneos/Runner.app
+      - yousu.ipa
+    publishing:
+      email:
+        recipients:
+          - your-email@example.com
+
+  # ──────────────────────────────────────────
+  # iOS 网页安装版（开发验证用）
+  # ──────────────────────────────────────────
+  ios-signing-build:
+    name: 有速 iOS (自动签名 Code Signing)
+    environment:
+      flutter: stable
+      xcode: latest
+      cocoapods: default
+    scripts:
+      - name: Set up keychain
+        script: |
+          keychain initialize
+      - name: Install dependencies
+        script: |
+          flutter pub get
+          cd ios && pod install && cd ..
+      - name: Set build number
+        script: |
+          BUILD_NUMBER=$(($(date +%s)))
+          sed -i '' "s/CURRENT_PROJECT_VERSION.*/CURRENT_PROJECT_VERSION = $BUILD_NUMBER;/" ios/Runner.xcodeproj/project.pbxproj
+      - name: Build iOS with signing
+        script: |
+          xcode-project use-profiles
+          flutter build ipa --release \
+            --export-options-plist=ios/exportOptions.plist
+    artifacts:
+      - build/ios/ipa/*.ipa
+    publishing:
+      email:
+        recipients:
+          - your-email@example.com
+
+  # ──────────────────────────────────────────
+  # Android 构建（完全免费）
+  # ──────────────────────────────────────────
+  android-build:
+    name: 有速 Android Build
+    environment:
+      flutter: stable
+    scripts:
+      - name: Install dependencies
+        script: flutter pub get
+      - name: Build APK
+        script: flutter build apk --release
+      - name: Build App Bundle
+        script: flutter build appbundle --release
+    artifacts:
+      - build/app/outputs/flutter-apk/app-release.apk
+      - build/app/outputs/bundle/release/app-release.aab
