@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import '../models/trip.dart';
 import '../services/location_manager.dart';
@@ -72,6 +73,13 @@ class SpeedViewModel extends ChangeNotifier {
   final List<SpeedDataPoint> speedHistory = [];
   static const int maxHistoryPoints = 300;
 
+  // 限流：最多每 200ms 记录一个数据点
+  DateTime? _lastRecordTime;
+
+  // 上一次 GPS 坐标（用于距离累积）
+  double? _prevLatitude;
+  double? _prevLongitude;
+
   // 当前行程
   Trip? _currentTrip;
 
@@ -94,8 +102,11 @@ class SpeedViewModel extends ChangeNotifier {
     _heading = 0;
     _altitude = 0;
     _distance = 0;
+    _prevLatitude = null;
+    _prevLongitude = null;
     _state = SpeedState.running;
     speedHistory.clear();
+    _lastRecordTime = null;
 
     // 创建行程
     _currentTrip = Trip.create();
@@ -155,20 +166,21 @@ class SpeedViewModel extends ChangeNotifier {
     }
 
     _heading = loc.course;
+    _altitude = loc.altitude;
 
-    // 确保在 startUpdating 后被正确解析
-    if (loc.timestamp.millisecondsSinceEpoch > 0) {
-      _altitude = loc.altitude;
-    }
-
-    // 累积距离
-    if (speedHistory.isNotEmpty) {
-      final last = speedHistory.last;
-      final dt = loc.timestamp.difference(last.timestamp).inMilliseconds / 1000.0;
-      if (dt > 0 && dt < 10) {
-        _distance += (loc.speed * dt) / 1000.0; // m/s * s = m → km
+    // 用经纬度差分累积距离（比 speed*dt 更准确）
+    if (_prevLatitude != null && _prevLongitude != null) {
+      final deltaM = _haversineDistance(
+        _prevLatitude!, _prevLongitude!,
+        loc.latitude, loc.longitude,
+      );
+      if (deltaM < 500) {
+        // 过滤掉 GPS 跳变（>500m 不累计）
+        _distance += deltaM / 1000.0; // m → km
       }
     }
+    _prevLatitude = loc.latitude;
+    _prevLongitude = loc.longitude;
 
     notifyListeners();
   }
@@ -176,32 +188,15 @@ class SpeedViewModel extends ChangeNotifier {
   void _onSensorUpdate() {
     if (_state != SpeedState.running && _state != SpeedState.noGps) return;
 
-    final sensor = _sensorManager.data;
     final loc = _locationManager.locationData;
 
-    final now = DateTime.now();
-    final dt = speedHistory.isNotEmpty
-        ? now.difference(speedHistory.last.timestamp).inMilliseconds / 1000.0
-        : 0.0;
+    // 没有 GPS 数据时不做速度估算
+    if (loc == null || _lastGpsTime == null) return;
 
-    // 用加速度推断运动方向上的加速度
-    final accelForward = sensor.accelY; // Y 轴近似为前进方向
+    final sensor = _sensorManager.data;
 
-    double filteredSpeed;
-    if (loc != null && _lastGpsTime != null) {
-      // GPS 覆盖范围内，完整融合
-      filteredSpeed = _speedFilter.update(
-        gpsSpeedKmh: loc.speedKmh,
-        accelMs2: accelForward,
-        dt: dt.clamp(0, 1.0),
-      );
-    } else {
-      // GPS 丢失，仅用加速度推算
-      filteredSpeed = _speedFilter.predict(
-        accelForward,
-        dt.clamp(0, 1.0),
-      );
-    }
+    // 用 GPS 速度做绝对基准，平滑滤波
+    final filteredSpeed = _speedFilter.update(loc.speedKmh);
 
     _displaySpeed = filteredSpeed;
 
@@ -229,14 +224,19 @@ class SpeedViewModel extends ChangeNotifier {
     );
     _sceneConfidence = _sceneDetector.confidence;
 
-    // 记录数据点
-    speedHistory.add(SpeedDataPoint(
-      speed: filteredSpeed,
-      heading: _heading,
-      altitude: loc?.altitude,
-    ));
-    if (speedHistory.length > maxHistoryPoints) {
-      speedHistory.removeAt(0);
+    // 记录数据点（限流：最多 5Hz）
+    final now = DateTime.now();
+    if (_lastRecordTime == null ||
+        now.difference(_lastRecordTime!).inMilliseconds >= 200) {
+      _lastRecordTime = now;
+      speedHistory.add(SpeedDataPoint(
+        speed: filteredSpeed,
+        heading: _heading,
+        altitude: loc.altitude,
+      ));
+      if (speedHistory.length > maxHistoryPoints) {
+        speedHistory.removeAt(0);
+      }
     }
 
     notifyListeners();
@@ -263,4 +263,19 @@ class SpeedViewModel extends ChangeNotifier {
     _predictionTimer?.cancel();
     super.dispose();
   }
-}
+
+  /// Haversine 公式计算两点间距离（米）
+  double _haversineDistance(
+    double lat1, double lon1, double lat2, double lon2,
+  ) {
+    const R = 6371000.0; // 地球半径（米）
+    final dLat = (lat2 - lat1) * math.pi / 180.0;
+    final dLon = (lon2 - lon1) * math.pi / 180.0;
+    final rLat1 = lat1 * math.pi / 180.0;
+    final rLat2 = lat2 * math.pi / 180.0;
+    final a = math.sin(dLat / 2) * math.sin(dLat / 2) +
+        math.cos(rLat1) * math.cos(rLat2) *
+            math.sin(dLon / 2) * math.sin(dLon / 2);
+    final c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a));
+    return R * c;
+  }
